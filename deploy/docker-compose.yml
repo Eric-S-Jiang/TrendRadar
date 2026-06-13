@@ -1,0 +1,99 @@
+# GPXX V3 生产部署 — 3 容器架构（复用宿主机已有 Nginx）
+# 启动：cd deploy && docker compose --env-file .env.production up -d --build
+version: '3.9'
+
+services:
+
+  # ── Redis ─────────────────────────────────────────────────
+  gpxx-redis:
+    image: redis:7-alpine
+    container_name: gpxx-redis
+    restart: unless-stopped
+    volumes:
+      - ${DATA_DIR}/redis:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+    networks: [gpxx-net]
+    deploy:
+      resources:
+        limits:
+          memory: 150M
+          cpus: '0.3'
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── FastAPI 后端 ───────────────────────────────────────────
+  gpxx-backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: gpxx-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////data/sqlite/gpxx.db
+      TREND_DATABASE_URL: sqlite+aiosqlite:////data/sqlite/trend.db
+      REDIS_URL: redis://:${REDIS_PASSWORD}@gpxx-redis:6379/0
+      USE_FAKEREDIS: "false"
+      JWT_SECRET: ${JWT_SECRET}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      TRENDRADAR_CONFIG_PATH: /app/config/trendradar.yaml
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SSE_MAX_CONNECTIONS: ${SSE_MAX_CONNECTIONS:-100}
+      GUEST_MODE_ENABLED: ${GUEST_MODE_ENABLED:-true}
+    volumes:
+      - ${DATA_DIR}/sqlite:/data/sqlite
+      - ${DATA_DIR}/logs:/app/logs
+    depends_on:
+      gpxx-redis:
+        condition: service_healthy
+    networks: [gpxx-net]
+    ports:
+      - "127.0.0.1:8000:8000"   # 只绑本机，由宿主 Nginx 反代，不暴露公网
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+          cpus: '1.5'
+        reservations:
+          memory: 200M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── TrendRadar 数据采集（cron） ────────────────────────────
+  gpxx-trendradar:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: gpxx-trendradar
+    restart: unless-stopped
+    environment:
+      RUN_MODE: cron
+      CRON_SCHEDULE: "*/30 * * * *"
+      IMMEDIATE_RUN: "true"
+      CONFIG_PATH: /app/config/trendradar.yaml
+    volumes:
+      - ${DATA_DIR}/sqlite:/data/sqlite
+      - ${DATA_DIR}/trend-config:/app/config
+    networks: [gpxx-net]
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+          cpus: '0.5'
+
+networks:
+  gpxx-net:
+    driver: bridge
+    name: gpxx-net
